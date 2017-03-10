@@ -38,13 +38,12 @@ type CommitGPGSignature struct {
 // similar to https://github.com/git/git/blob/3bc53220cb2dcf709f7a027a3f526befd021d858/commit.c#L1128
 func newGPGSignatureFromCommitline(data []byte, signatureStart int) (*CommitGPGSignature, error) {
 	sig := new(CommitGPGSignature)
-	sig.Payload = string(data[:signatureStart-8])
 	signatureEnd := bytes.LastIndex(data, []byte("-----END PGP SIGNATURE-----"))
 	if signatureEnd == -1 {
 		return nil, fmt.Errorf("end of commit signature not found")
 	}
-	sig.Signature = string(data[signatureStart : signatureEnd+27])
-
+	sig.Signature = strings.Replace(string(data[signatureStart:signatureEnd+27]), "\n ", "\n", -1)
+	sig.Payload = string(data[:signatureStart-8]) + string(data[signatureEnd+27:])
 	return sig, nil
 }
 
