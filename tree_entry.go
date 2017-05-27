@@ -6,6 +6,7 @@ package git
 
 import (
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -144,147 +145,112 @@ func (tes Entries) Sort() {
 	sort.Sort(tes)
 }
 
-// getCommitInfoState transient state for getting commit info for entries
-type getCommitInfoState struct {
-	entries        map[string]*TreeEntry // map from filepath to entry
-	commits        map[string]*Commit    // map from entry name to commit
-	lastCommitHash string
-	lastCommit     *Commit
-	treePath       string
-	headCommit     *Commit
-	nextSearchSize int // next number of commits to search for
+type taskResult struct {
+	commit string
+	paths  []string
 }
 
-func initGetCommitInfoState(entries Entries, headCommit *Commit, treePath string) *getCommitInfoState {
-	entriesByPath := make(map[string]*TreeEntry, len(entries))
-	for _, entry := range entries {
-		entriesByPath[filepath.Join(treePath, entry.Name())] = entry
+func logCommand(currentCommit, treePath string) *Command {
+	var commitHash string
+	if len(currentCommit) == 0 {
+		commitHash = "HEAD"
+	} else {
+		commitHash = currentCommit + "^"
 	}
-	return &getCommitInfoState{
-		entries:        entriesByPath,
-		commits:        make(map[string]*Commit, len(entriesByPath)),
-		treePath:       treePath,
-		headCommit:     headCommit,
-		nextSearchSize: 16,
+	return NewCommand("log", prettyLogFormat, "--name-only", "-2", commitHash, "--", treePath)
+}
+
+func getCommitInfos(headCommit *Commit, currentCommit, treePath string) (*taskResult, error) {
+	logOutput, err := logCommand(currentCommit, treePath).RunInDir(headCommit.repo.Path)
+	if err != nil {
+		return nil, err
 	}
+	lines := strings.Split(logOutput, "\n")
+	paths := make([]string, len(lines)) //TODO
+	/*
+		i := 0
+		for i < len(lines) {
+			state.nextCommit(lines[i])
+			i++
+			for ; i < len(lines); i++ {
+				path := lines[i]
+				if path == "" {
+					break
+				}
+				state.update(path)
+			}
+			i++ // skip blank line
+			if len(state.entries) == len(state.commits) {
+				break
+			}
+		}
+	*/
+	return &taskResult{
+		commit: currentCommit,
+		paths:  paths,
+	}, nil
+}
+
+// GetCommitsInfoWithCustomConcurrency takes advantages of concurrency to speed up getting information
+func (tes Entries) GetCommitsInfoWithCustomConcurrency(headCommit *Commit, treePath string, maxConcurrency int) ([][]interface{}, error) {
+	//Init
+	commitsInfo := make([][]interface{}, len(tes))
+	if maxConcurrency <= 0 {
+		maxConcurrency = runtime.NumCPU()
+	}
+	done := make(chan bool)
+	chanTask := make(chan taskResult, maxConcurrency)
+	chanResponse := make(chan taskResult, maxConcurrency)
+	nbStarted := 0
+	nbRunning := 0
+
+	//Start thread for parsing
+	go func() {
+		for result := range chanResponse { //TODO check nil
+			for path := range result.paths {
+				relPath, err := filepath.Rel(treePath, path)
+				log("%v %v", relPath, err)
+			}
+		}
+		done <- true
+	}()
+
+	//Start threads if we miss information
+	for len(tes) > len(commitsInfo) {
+		if (len(tes) - len(commitsInfo)) <= (maxConcurrency + nbStarted) { //We have only few file to found commit compared to allready run and number of goroutine
+			go func() {
+				c, err := headCommit.GetCommitByPath(filepath.Join(treePath, tes[i].Name()))
+				chanTask <- err
+				chanResponse <- taskResult{
+					commit: c,
+					paths:  []string{tes[i].Name()},
+				}
+			}()
+		} else {
+			go func() {
+				currentCommit := headCommit.ID.String() //TODO
+				r, err := getCommitInfos(headCommit, currentCommit, treePath)
+				chanTask <- err
+				chanResponse <- r
+			}()
+		}
+		nbRunning++
+		nbStarted++
+
+		if nbStarted >= maxConcurrency || (len(tes)-len(commitsInfo)) <= (nbStarted) { //Wait for a routine to finish because max running or waiting for end
+			err <- chanTask
+			if err != nil {
+				return nil, err
+			}
+			nbRunning--
+		}
+	}
+
+	<-done
+	return commitsInfo, nil
 }
 
 // GetCommitsInfo gets information of all commits that are corresponding to these entries
 func (tes Entries) GetCommitsInfo(commit *Commit, treePath string) ([][]interface{}, error) {
-	state := initGetCommitInfoState(tes, commit, treePath)
-	if err := getCommitsInfo(state); err != nil {
-		return nil, err
-	}
-
-	commitsInfo := make([][]interface{}, len(tes))
-	for i, entry := range tes {
-		commit = state.commits[filepath.Join(treePath, entry.Name())]
-		switch entry.Type {
-		case ObjectCommit:
-			subModuleURL := ""
-			if subModule, err := state.headCommit.GetSubModule(entry.Name()); err != nil {
-				return nil, err
-			} else if subModule != nil {
-				subModuleURL = subModule.URL
-			}
-			subModuleFile := NewSubModuleFile(commit, subModuleURL, entry.ID.String())
-			commitsInfo[i] = []interface{}{entry, subModuleFile}
-		default:
-			commitsInfo[i] = []interface{}{entry, commit}
-		}
-	}
-	return commitsInfo, nil
-}
-
-func (state *getCommitInfoState) nextCommit(hash string) {
-	state.lastCommitHash = hash
-	state.lastCommit = nil
-}
-
-func (state *getCommitInfoState) commit() (*Commit, error) {
-	var err error
-	if state.lastCommit == nil {
-		state.lastCommit, err = state.headCommit.repo.GetCommit(state.lastCommitHash)
-	}
-	return state.lastCommit, err
-}
-
-func (state *getCommitInfoState) update(path string) error {
-	relPath, err := filepath.Rel(state.treePath, path)
-	if err != nil {
-		return nil
-	}
-	var entryPath string
-	if index := strings.IndexRune(relPath, '/'); index >= 0 {
-		entryPath = filepath.Join(state.treePath, relPath[:index])
-	} else {
-		entryPath = path
-	}
-	if _, ok := state.entries[entryPath]; !ok {
-		return nil
-	} else if _, ok := state.commits[entryPath]; ok {
-		return nil
-	}
-	state.commits[entryPath], err = state.commit()
-	return err
-}
-
-func getCommitsInfo(state *getCommitInfoState) error {
-	for len(state.entries) > len(state.commits) {
-		if err := getNextCommitInfos(state); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func getNextCommitInfos(state *getCommitInfoState) error {
-	logOutput, err := logCommand(state.lastCommitHash, state).RunInDir(state.headCommit.repo.Path)
-	if err != nil {
-		return err
-	}
-	lines := strings.Split(logOutput, "\n")
-	i := 0
-	for i < len(lines) {
-		state.nextCommit(lines[i])
-		i++
-		for ; i < len(lines); i++ {
-			path := lines[i]
-			if path == "" {
-				break
-			}
-			state.update(path)
-		}
-		i++ // skip blank line
-		if len(state.entries) == len(state.commits) {
-			break
-		}
-	}
-	return nil
-}
-
-func logCommand(exclusiveStartHash string, state *getCommitInfoState) *Command {
-	var commitHash string
-	if len(exclusiveStartHash) == 0 {
-		commitHash = "HEAD"
-	} else {
-		commitHash = exclusiveStartHash + "^"
-	}
-	var command *Command
-	numRemainingEntries := len(state.entries) - len(state.commits)
-	if numRemainingEntries < 32 {
-		searchSize := (numRemainingEntries + 1) / 2
-		command = NewCommand("log", prettyLogFormat, "--name-only",
-			"-"+strconv.Itoa(searchSize), commitHash, "--")
-		for path, entry := range state.entries {
-			if _, ok := state.commits[entry.Name()]; !ok {
-				command.AddArguments(path)
-			}
-		}
-	} else {
-		command = NewCommand("log", prettyLogFormat, "--name-only",
-			"-"+strconv.Itoa(state.nextSearchSize), commitHash, "--", state.treePath)
-	}
-	state.nextSearchSize += state.nextSearchSize
-	return command
+	return tes.GetCommitsInfoWithCustomConcurrency(commit, treePath, 0)
 }
