@@ -194,22 +194,28 @@ func getCommitInfos(headCommit *Commit, currentCommit, treePath string) (*taskRe
 // GetCommitsInfoWithCustomConcurrency takes advantages of concurrency to speed up getting information
 func (tes Entries) GetCommitsInfoWithCustomConcurrency(headCommit *Commit, treePath string, maxConcurrency int) ([][]interface{}, error) {
 	//Init
-	commitsInfo := make([][]interface{}, len(tes))
+	commitsInfo := make([][]interface{}, len(tes))             //TODO
+	commitsMapInfo := make(map[string][]interface{}, len(tes)) //TODO
 	if maxConcurrency <= 0 {
 		maxConcurrency = runtime.NumCPU()
 	}
 	done := make(chan bool)
 	chanTask := make(chan taskResult, maxConcurrency)
-	chanResponse := make(chan taskResult, maxConcurrency)
+	chanResponse := make(chan taskResult, maxConcurrency*10) //TODO find perferct size
 	nbStarted := 0
 	nbRunning := 0
+	nbCommitParsing := 4
+	nextPathMissing := 0 //Index in tes entry of next not found entry
 
 	//Start thread for parsing
 	go func() {
 		for result := range chanResponse { //TODO check nil
-			for path := range result.paths {
+			for _, path := range result.paths {
 				relPath, err := filepath.Rel(treePath, path)
 				log("%v %v", relPath, err)
+			}
+			if len(tes) == len(commitsInfo) {
+				break //Finish line
 			}
 		}
 		done <- true
@@ -217,9 +223,15 @@ func (tes Entries) GetCommitsInfoWithCustomConcurrency(headCommit *Commit, treeP
 
 	//Start threads if we miss information
 	for len(tes) > len(commitsInfo) {
-		if (len(tes) - len(commitsInfo)) <= (maxConcurrency + nbStarted) { //We have only few file to found commit compared to allready run and number of goroutine
+		if (len(tes) - len(commitsInfo)) <= (maxConcurrency + nbStarted) { //We have only few file to found commit compared to allready run and number of goroutine //TODO analyze
 			go func() {
-				c, err := headCommit.GetCommitByPath(filepath.Join(treePath, tes[i].Name()))
+				for ; nextPathMissing < len(tes); nextPathMissing++ {
+					if _, ok := commitsMapInfo[tes[nextPathMissing].Name()]; !ok {
+						break //Found the nextPathMissing
+					}
+				}
+				//TODO detect end and multiple access to nextPathMissing
+				c, err := headCommit.GetCommitByPath(filepath.Join(treePath, tes[nextPathMissing].Name()))
 				chanTask <- err
 				chanResponse <- taskResult{
 					commit: c,
@@ -228,7 +240,7 @@ func (tes Entries) GetCommitsInfoWithCustomConcurrency(headCommit *Commit, treeP
 			}()
 		} else {
 			go func() {
-				currentCommit := headCommit.ID.String() //TODO
+				currentCommit := headCommit.ID.String() //TODO maybe used HEAD~4 ????
 				r, err := getCommitInfos(headCommit, currentCommit, treePath)
 				chanTask <- err
 				chanResponse <- r
@@ -237,15 +249,20 @@ func (tes Entries) GetCommitsInfoWithCustomConcurrency(headCommit *Commit, treeP
 		nbRunning++
 		nbStarted++
 
-		if nbStarted >= maxConcurrency || (len(tes)-len(commitsInfo)) <= (nbStarted) { //Wait for a routine to finish because max running or waiting for end
+		if nbRunning >= maxConcurrency || (len(tes)-len(commitsInfo)) <= (nbStarted) { //Wait for a routine to finish because max running or waiting for end //TODO analyze
 			err <- chanTask
 			if err != nil {
 				return nil, err
 			}
 			nbRunning--
 		}
+		if nbStarted%maxConcurrency == 0 && nbStarted > 0 {
+			nbCommitParsing *= 2
+		}
 	}
 
+	//TODO handle submodule
+	//TODO check that all go routine are finished
 	<-done
 	return commitsInfo, nil
 }
