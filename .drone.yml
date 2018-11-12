@@ -13,20 +13,27 @@ pipeline:
   test-general:
     image: webhippie/golang:edge
     pull: true
+    environment:
+      - GO111MODULE=on
     commands:
       - make clean
       - make vet
       - make lint
       - make build
+      - go mod vendor #Used as a cache across pipeline (could be improve by caching go env GOCACHE across pipeline)
   testing-git-latest:
     image: webhippie/golang:edge
     pull: true
+    environment:
+      - GO111MODULE=on
     commands:
       - git update-ref refs/heads/test HEAD
       - git --version && make test
   testing-git-1.7:
     image: docker.kbt.io/gitea-git-ci:1.7
     pull: true
+    environment:
+      - GO111MODULE=on
     commands:
       - git update-ref refs/heads/test HEAD
       - PATH=/opt/git-1.7.2/bin git --version && make test
