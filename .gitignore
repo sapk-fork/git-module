@@ -27,3 +27,5 @@ coverage.out
 
 benchmark/
 tests/repos/repo1/
+
+vendor/
